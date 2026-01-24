@@ -2065,6 +2065,24 @@ class DagRun(Base, LoggingMixin):
         count = 0
 
         if schedulable_ti_ids:
+            from datetime import timedelta
+
+            from airflow.models.taskreschedule import TaskReschedule
+
+            current_time = timezone.utcnow()
+
+            # Create subquery to check for recent reschedules
+            # This prevents race condition where sensor has rescheduled but state hasn't propagated
+            from sqlalchemy import and_, exists
+
+            reschedule_exists = exists().where(
+                and_(
+                    TaskReschedule.ti_id == TI.id,
+                    TaskReschedule.reschedule_date > current_time - timedelta(minutes=2),
+                    TaskReschedule.reschedule_date <= current_time + timedelta(minutes=1),
+                )
+            )
+
             schedulable_ti_ids_chunks = chunks(
                 schedulable_ti_ids, max_tis_per_query or len(schedulable_ti_ids)
             )
@@ -2074,12 +2092,16 @@ class DagRun(Base, LoggingMixin):
                     .where(TI.id.in_(id_chunk))
                     .values(
                         state=TaskInstanceState.SCHEDULED,
-                        scheduled_dttm=timezone.utcnow(),
+                        scheduled_dttm=current_time,
                         try_number=case(
-                            (
-                                or_(TI.state.is_(None), TI.state != TaskInstanceState.UP_FOR_RESCHEDULE),
-                                TI.try_number + 1,
-                            ),
+                            # Don't increment if state is UP_FOR_RESCHEDULE
+                            (TI.state == TaskInstanceState.UP_FOR_RESCHEDULE.value, TI.try_number),
+                            # Don't increment if recent reschedule exists
+                            (reschedule_exists, TI.try_number),
+                            # Don't increment if state is None (sensor first run after reschedule)
+                            (TI.state.is_(None), TI.try_number + 1),
+                            # Otherwise check if not UP_FOR_RESCHEDULE and increment
+                            (TI.state != TaskInstanceState.UP_FOR_RESCHEDULE.value, TI.try_number + 1),
                             else_=TI.try_number,
                         ),
                     )
